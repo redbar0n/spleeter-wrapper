@@ -121,7 +121,7 @@ STEM_NAMES=( "${FIVE_STEMS[@]}" )
 #     Disk space usage, at most = Size of original file * amount of stems * 2 (since -30 and -offsets) * 2 (under joinAllStems when splitting into 1s clips).
 #     So if processing an orig. 2h WAV audio file taking 669 MB, and we use spleeter with 5stems and spleeter's default output WAV, then it would take 669 * 5 * 2 * 2 = 13380 MB = 13.38 GB disk space during processing.
 # At this time, Spleeter supports outputting either: WAV, MP3, OGG, M4A, WMA, FLAC. Use `spleeter separate -h` to see currently available formats.
-# This script only supports internal processing using WAV, MP3, M4A, since the other formats cause various problems, documented below.
+# This script does not support OGG since Spleeter then requires libvorbis codec installed locally, which is not installed with ffmpeg by default.
 # But the _final_ output file format will always be the same as the file format of the original input file, which the user sends in as the first param to this script.
 SPLEETER_OUT_EXT="wav" # wav since it is the spleeter default. Lowercase required by spleeter.
 
@@ -165,10 +165,10 @@ else
               if [[
                         $SPLEETER_OUT_EXT != "wav"
                   && $SPLEETER_OUT_EXT != "mp3"
-                  # && $SPLEETER_OUT_EXT != "ogg" # requires libvorbis codec installed locally, which is not default
+                  #&& $SPLEETER_OUT_EXT != "ogg" # requires libvorbis codec installed locally, which is not installed with ffmpeg by default. Must also be concated with ffmpeg's concat protocol to avoid "unknown keyword 'OggS'" and 'Invalid data found when processing input'. It will still give "failed to create or replace stream" undeway but the output sounds nice.
                   && $SPLEETER_OUT_EXT != "m4a"
-                  # && $SPLEETER_OUT_EXT != "wma" # errors in concatenation
-                  # && $SPLEETER_OUT_EXT != "flac" # does not remove cracks properly
+                  && $SPLEETER_OUT_EXT != "wma"
+                  && $SPLEETER_OUT_EXT != "flac"
                 ]]; then
                 die 'ERROR: "-p" or "--process_codec" only supports either: WAV, MP3, M4A.'
               fi
@@ -228,6 +228,37 @@ echo "Final output EXT:"
 echo "$EXT"
 
 
+# Will concatenate all the files in a list, to a file, using the supplied format/extension (both for the files and the result).
+# Files in the concat list, given as the first param, should have same extension as the result, given in the third param.
+reliable_but_slower_concat () {
+  local CONCAT_LIST DEST_FILE LOCAL_EXT
+  CONCAT_LIST="$1" # e.g. "concat-orig.txt" or "concat-seconds.txt"
+  DEST_FILE="$2" # e.g. "separated/filename/vocals-30.m4a" or "separated/filename/vocals.m4a"
+  LOCAL_EXT="$3"
+
+  # Concatenate the parts using the original format.
+  # Front-load the acc_result by copying in the first part.
+  IFS= read -r first_part < "$CONCAT_LIST"
+  ffmpeg -i "$first_part" -filter_complex '[0:0]concat=n=1:v=0:a=1[out]' -map '[out]' acc_result.$LOCAL_EXT
+  rm "$first_part"
+  # Remove first line from file, since it references the first part,
+  # and successively concat with each new part, from second line onwards.
+  sed 1d "$CONCAT_LIST" | while IFS="" read -r line; do
+    # Use filter to correctly concat all file types.
+    # -nostdin so that ffmpeg doesn't suck up 2 standard input characters that should go to the next read cmd in the while loop: http://mywiki.wooledge.org/BashFAQ/089
+    ffmpeg -nostdin -i acc_result.$LOCAL_EXT -i "$line" -filter_complex "[0:0][1:0]concat=n=2:v=0:a=1[out]" -map "[out]" tmp.$LOCAL_EXT
+    # Remove the parts file
+    rm "$line"
+    # Remove old STEM acc_result
+    rm acc_result.$LOCAL_EXT
+    # and set concatenated STEM as the new accumulated acc_result
+    mv tmp.$LOCAL_EXT acc_result.$LOCAL_EXT
+  done
+
+  # Move the acc_result to the destination file, using the same extension
+  mv acc_result.$LOCAL_EXT $DEST_FILE.$LOCAL_EXT
+}
+
 
 # Will join one stem presumed output by Spleeter.
 joinStem () {
@@ -243,11 +274,16 @@ joinStem () {
   # It will here be like: ("separated/filename-000/vocals.m4a", "separated/filename-001/vocals.m4a", ...)
   fileArrayStem=( ${FILE_ARRAY[@]/%//$STEM.$LOCAL_EXT} ) # not using readarray/mapfile since not in Bash below v4.
 
-  # List all files to be joined in a file for ffmpeg to use as input list
-  printf "file '%s'\n" "${fileArrayStem[@]}" > concat-orig.txt # where > will overwrite the file if it already exists.
-
-  # Concats the files in the list to destination file, e.g.: "separated/filename/vocals-30.m4a"
-  ffmpeg -f concat -safe 0 -i concat-orig.txt -c copy separated/"$NAME"/$STEM$SPLITS.$LOCAL_EXT
+  if [[ $SPLEETER_OUT_EXT == "wma" || $SPLEETER_OUT_EXT == "flac" ]]; then
+    # List all files to be joined in a file for ffmpeg to use as input list
+    printf "%s\n" "${fileArrayStem[@]}" > concat-orig.txt
+    reliable_but_slower_concat concat-orig.txt separated/"$NAME"/$STEM$SPLITS $LOCAL_EXT # extension added by concat
+  else
+    printf "file '%s'\n" "${fileArrayStem[@]}" > concat-orig.txt
+    # Concats the files in the list to destination file, e.g.: "separated/filename/vocals-30.m4a"
+    # Use demuxer to concat fast.
+    ffmpeg -f concat -safe 0 -i concat-orig.txt -c copy separated/"$NAME"/$STEM$SPLITS.$LOCAL_EXT
+  fi
 
   # Cleanup
   rm concat-orig.txt
@@ -325,6 +361,7 @@ offsetSplit () {
     prev=$(( $cur - 1 ))
     prevPad=$(printf "%03d" $prev)
   done
+  # TODO: Potentially reuse the reliable_but_slower_concat() func here by rewriting the above to create a concat list (of every two files) to send in to it.
 }
 
 
@@ -411,12 +448,17 @@ killCracksAndCreateOutput () {
   # Free up some space early
   rm -r parts-offset
 
-  # Create list of the parts, with lines like: `file 'parts-30/vocals-30-000000.m4a'` etc.
-  find parts-30 -name "$STEM*" | sort -n | sed 's:\ :\\\ :g' | sed "s/^/file '/" | sed "s/$/'/" > concat-seconds.txt
-
-  # Reassemble the full stem / create output.
-  # Result placed in: `separated/"$NAME"/$STEM.$LOCAL_EXT`
-  ffmpeg -f concat -safe 0 -i concat-seconds.txt -c copy $STEM.$LOCAL_EXT
+  if [[ $SPLEETER_OUT_EXT == "wma" || $SPLEETER_OUT_EXT == "flac" ]]; then
+    find parts-30 -name "$STEM*" | sort -n | sed 's:\ :\\\ :g' > concat-seconds.txt
+    # Reassemble the full stem / create output.
+    # Result placed in: `separated/"$NAME"/$STEM.$LOCAL_EXT`
+    reliable_but_slower_concat concat-seconds.txt $STEM $LOCAL_EXT
+  else
+    # Create list of the parts, with lines like: `file 'parts-30/vocals-30-000000.m4a'` etc.
+    find parts-30 -name "$STEM*" | sort -n | sed 's:\ :\\\ :g' | sed "s/^/file '/" | sed "s/$/'/" > concat-seconds.txt
+    # Use demuxer to concat fast.
+    ffmpeg -f concat -safe 0 -i concat-seconds.txt -c copy $STEM.$LOCAL_EXT
+  fi
 
   # Clean up rest
   rm -r parts-30 # just the folder, at this point, since content cleaned up in concat() underway.
